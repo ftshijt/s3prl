@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from s3prl.utility.helper import show
 
 SAMPLE_RATE = 16000
-TOLERABLE_SEQLEN_DIFF = 5
+TOLERABLE_SEQLEN_DIFF = 10
 
 
 class Hook:
@@ -139,6 +139,7 @@ class Featurizer(nn.Module):
         upstream_device: str = "cuda",
         layer_selection: int = None,
         normalize: bool = False,
+        feature_mismatch_handler: str = "concat",
         **kwargs,
     ):
         super().__init__()
@@ -151,11 +152,11 @@ class Featurizer(nn.Module):
 
         if feature_selection not in paired_features:
             if "hidden_states" in paired_features:
-                show(
-                    f"[{self.name}] - Warning: {feature_selection} is not a supported args.upstream_feature_selection."
-                    f" Using \"hidden_states\" as the default key.",
-                    file=sys.stderr
-                )
+                # show(
+                #     f"[{self.name}] - Warning: {feature_selection} is not a supported args.upstream_feature_selection."
+                #     f" Using \"hidden_states\" as the default key.",
+                #     file=sys.stderr
+                # )
                 feature_selection = "hidden_states"
             else:
                 show(
@@ -168,14 +169,39 @@ class Featurizer(nn.Module):
         self.feature_selection = feature_selection
         self.layer_selection = layer_selection
         self.normalize = normalize
+        self.feature_mismatch_handler = feature_mismatch_handler
+
+        # feature_groups should like {"hidden_states": [[feature_indices], ...,[feature_indices]]}
+        self.groups = getattr(upstream, "feature_groups", None)
+        if self.groups and feature_mismatch_handler == "concat":
+            # check there is no overlap between each group
+            for key in self.groups:
+                index_set = set()
+                index_count = 0
+                for group in self.groups[key]:
+                    index_set = index_set.union(set(group))
+                    index_count += len(group)
+                assert len(index_set) == index_count, f"Some feature groups are overlaped in feature_groups['{key}']"
+
+        # assert self.groups is not None
 
         feature = self._select_feature(paired_features)
         if isinstance(feature, (list, tuple)):
             self.layer_num = len(feature)
-            show(
-                f"[{self.name}] - Take a list of {self.layer_num} features and weighted sum them.",
-                file=sys.stderr
-            )
+            if feature_mismatch_handler == "linear":
+
+
+                # FIXME(jiatong) add a more elegant solution to featurize for unsupervised-ASR
+                if feature[-1].size(-1) != feature[0].size(-1):
+                    feature = list(feature)
+                    # feature dimension mismatch: add additional linear layer to proceed
+                    self.projector = nn.Linear(feature[-1].size(-1), feature[0].size(-1)).to(upstream_device)
+                    feature[-1] = self.projector(feature[-1])
+
+                show(
+                    f"[{self.name}] - Take a list of {self.layer_num} features and weighted sum them.",
+                    file=sys.stderr
+                )
             self.weights = nn.Parameter(torch.zeros(self.layer_num))
             feature = self._weighted_sum([f.cpu() for f in feature])
         else:
@@ -230,24 +256,46 @@ class Featurizer(nn.Module):
             " following options: --upstream_trainable --upstream_feature_selection last_hidden_state."
             " Or: -f -s last_hidden_state"
         )
-        stacked_feature = torch.stack(feature, dim=0)
+        # print([feat.size() for feat in feature])
+        # assert self.feature_mismatch_handler != "linear"
+        if self.groups is None or self.feature_mismatch_handler == "linear":
+            stacked_feature = torch.stack(feature, dim=0)
 
-        if self.normalize:
-            stacked_feature = F.layer_norm(
-                stacked_feature, (stacked_feature.shape[-1],))
+            if self.normalize:
+                stacked_feature = F.layer_norm(
+                    stacked_feature, (stacked_feature.shape[-1],))
 
-        _, *origin_shape = stacked_feature.shape
-        stacked_feature = stacked_feature.view(self.layer_num, -1)
-        norm_weights = F.softmax(self.weights, dim=-1)
-        weighted_feature = (norm_weights.unsqueeze(-1) * stacked_feature).sum(dim=0)
-        weighted_feature = weighted_feature.view(*origin_shape)
+            _, *origin_shape = stacked_feature.shape
+            stacked_feature = stacked_feature.view(self.layer_num, -1)
+            norm_weights = F.softmax(self.weights, dim=-1)
+            weighted_feature = (norm_weights.unsqueeze(-1) * stacked_feature).sum(dim=0)
+            weighted_feature = weighted_feature.view(*origin_shape)
+        else:
+            weighted_features = []
+            groups = self.groups.get(self.feature_selection, self.groups["hidden_states"])
+            for group in groups:
+                subfeature = [feature[i] for i in group]
+                stacked_feature = torch.stack(subfeature, dim=0)
+
+                if self.normalize:
+                    stacked_feature = F.layer_norm(
+                        stacked_feature, (stacked_feature.shape[-1],))
+
+                _, *origin_shape = stacked_feature.shape
+                stacked_feature = stacked_feature.view(len(group), -1)
+                norm_weights = F.softmax(self.weights[group], dim=-1)
+                weighted_feature = (norm_weights.unsqueeze(-1) * stacked_feature).sum(dim=0)
+                weighted_feature = weighted_feature.view(*origin_shape)
+                weighted_features.append(weighted_feature)
+
+            weighted_feature = torch.cat(weighted_features, dim=-1)
 
         return weighted_feature
 
     def tolist(self, paired_wavs: List[Tensor], paired_feature: Tensor):
         assert paired_feature.dim() == 3, "(batch_size, max_seq_len, feat_dim)"
         feature_len = [round(len(wav) / self.downsample_rate) for wav in paired_wavs]
-        assert abs(paired_feature.size(1) - round(max([len(wav) for wav in paired_wavs]) / self.downsample_rate)) < TOLERABLE_SEQLEN_DIFF
+        assert abs(paired_feature.size(1) - round(max([len(wav) for wav in paired_wavs]) / self.downsample_rate)) < TOLERABLE_SEQLEN_DIFF, "not matched size {} (paired_feature), {} (paired wavs)".format(paired_feature.size(1), round(max([len(wav) for wav in paired_wavs])))
         feature = [f[:l] for f, l in zip(paired_feature, feature_len)]
         return feature
 
@@ -258,6 +306,11 @@ class Featurizer(nn.Module):
     ):
         feature = self._select_feature(paired_features)
         if isinstance(feature, (list, tuple)):
+            if self.feature_mismatch_handler == "linear":
+                if feature[-1].size(-1) != feature[0].size(-1):
+                    feature = list(feature)
+                    # feature dimension mismatch: add additional linear layer to proceed
+                    feature[-1] = self.projector(feature[-1])
             feature = self._weighted_sum(feature)
 
         return self.tolist(paired_wavs, feature)
