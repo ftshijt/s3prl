@@ -160,7 +160,6 @@ class S3prl_SpeechToTextDataset(SpeechToTextDataset):
     def __init__(self, *args, srs = Optional[List[int]], upstream_rate = 160, max_feature_len=-1, **kwargs):
         
         super().__init__(*args, **kwargs)
-
         self.srs = srs
         self.max_feature_len = max_feature_len
         self.max_wav_len = max_feature_len * upstream_rate
@@ -176,6 +175,13 @@ class S3prl_SpeechToTextDataset(SpeechToTextDataset):
             if self.max_feature_len > 0 and new_n_frames > max_feature_len:
                 new_n_frames = max_feature_len
             self.n_frames[i] = int(new_n_frames)
+
+    def tokenize_text(self, text: str):
+        if self.pre_tokenizer is not None:
+            text = self.pre_tokenizer.encode(text)
+        if self.bpe_tokenizer is not None:
+            text = self.bpe_tokenizer.encode(text)
+        return text
 
     def __getitem__(
         self, index: int
