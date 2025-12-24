@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
-from torchaudio.sox_effects import apply_effects_tensor
 
 import s3prl
 
